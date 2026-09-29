@@ -625,6 +625,20 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
 
       const { directory, sessionId, machineId, approvedNewDirectoryCreation = true } = options;
       const agent = options.agent ?? 'claude';
+      if (options.validateDirectory && !(await options.validateDirectory(directory))) {
+        return {
+          type: 'error',
+          errorMessage: 'Directory is outside this machine\'s workspace roots',
+          code: 'outside_workspace_roots',
+          childStarted: false,
+        };
+      }
+      // Reconnecting a verified live runtime does not launch Codex. A changed
+      // PATH or temporarily missing binary must not strand an existing root.
+      if (agent === 'codex' && options.existingSessionId) {
+        const existing = await reconnectSharedRunnerSession(options.existingSessionId);
+        if (existing) return existing;
+      }
       const availability = getAgentAvailability(agent);
       if (!availability.available) {
         const errorMessage = agentUnavailableMessage(availability);
@@ -640,18 +654,6 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
           agent,
           childStarted: false,
         };
-      }
-      if (options.validateDirectory && !(await options.validateDirectory(directory))) {
-        return {
-          type: 'error',
-          errorMessage: 'Directory is outside this machine\'s workspace roots',
-          code: 'outside_workspace_roots',
-          childStarted: false,
-        };
-      }
-      if (agent === 'codex' && options.existingSessionId) {
-        const existing = await reconnectSharedRunnerSession(options.existingSessionId);
-        if (existing) return existing;
       }
       const yolo = options.yolo === true;
       const sessionType = options.sessionType ?? 'simple';

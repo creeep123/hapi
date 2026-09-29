@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createServer, type ServerResponse } from 'node:http';
+import { createServer as createPortReservation } from 'node:net';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
@@ -33,13 +34,15 @@ async function eventually(check: () => Promise<boolean>, description: string, ti
 }
 
 // Explicit opt-in. Installed Codex, an isolated native store and local fake model;
-// the ordinary CLI test setup supplies an isolated real Hub and disposable auth.
+// disposable auth comes from CLI setup; this test owns a restartable private Hub.
 describe.skipIf(process.env.HAPI_RUN_SHARED_CODEX_TESTS !== '1')('Runner shared-session reconnect', () => {
     it('recovers the same live execution and preserves its in-flight turn and sibling', async () => {
         const home = await mkdtemp('/tmp/hapi-reconnect-');
         const nativeHome = join(home, 'codex');
         const requests: string[] = [];
         const runners: ChildProcess[] = [];
+        const hubs: ChildProcess[] = [];
+        const originalApiUrl = configuration.apiUrl;
         const stop = new AbortController();
         let running: Promise<void> | undefined;
         let native: CodexAppServerClient | undefined;
@@ -70,6 +73,42 @@ describe.skipIf(process.env.HAPI_RUN_SHARED_CODEX_TESTS !== '1')('Runner shared-
         });
         try {
             await mkdir(nativeHome);
+            const reservation = createPortReservation();
+            const hubPort = await new Promise<number>((resolve, reject) => {
+                reservation.once('error', reject);
+                reservation.listen(0, '127.0.0.1', () => {
+                    const address = reservation.address();
+                    const port = typeof address === 'object' && address ? address.port : 0;
+                    reservation.close(error => error ? reject(error) : resolve(port));
+                });
+            });
+            const hubHome = join(home, 'hub');
+            await mkdir(hubHome);
+            const base = `http://127.0.0.1:${hubPort}`;
+            vi.stubEnv('HAPI_API_URL', base);
+            configuration._setApiUrl(base);
+            const startHub = async () => {
+                // Explicit whitelist: never inherit a production DB or notifier.
+                const child = spawn(process.env.HAPI_BUN_EXEC!, ['run', resolve('../hub/src/index.ts')], {
+                    env: {
+                        PATH: process.env.PATH, HOME: process.env.HOME,
+                        TMPDIR: process.env.TMPDIR, BUN_INSTALL: process.env.BUN_INSTALL,
+                        HAPI_HOME: hubHome, DB_PATH: join(hubHome, 'hapi.db'),
+                        HAPI_LISTEN_PORT: String(hubPort), HAPI_LISTEN_HOST: '127.0.0.1',
+                        HAPI_PUBLIC_URL: base, CLI_API_TOKEN: process.env.CLI_API_TOKEN,
+                        HAPI_TEST_MARKER: process.env.HAPI_HOME,
+                        TELEGRAM_NOTIFICATION: 'false', SERVERCHAN_NOTIFICATION: 'false',
+                    }, stdio: 'ignore'
+                });
+                trackChildProcess(child, 'reconnect-private-hub');
+                hubs.push(child);
+                await eventually(async () => {
+                    try { return (await fetch(`${base}/health`, { signal: AbortSignal.timeout(1000) })).ok; }
+                    catch { return false; }
+                }, 'private Hub starts');
+                return child;
+            };
+            const firstHub = await startHub();
             await new Promise<void>(resolve => model.listen(0, '127.0.0.1', resolve));
             const port = (model.address() as { port: number }).port;
             await writeFile(join(nativeHome, 'config.toml'), `model = "mock-model"
@@ -92,7 +131,6 @@ enabled = false
             `);
             vi.stubEnv('CODEX_HOME', nativeHome);
             await updateSettings(settings => ({ ...settings, machineId: settings.machineId ?? randomUUID() }));
-            const base = process.env.HAPI_API_URL!;
             const auth = await fetch(`${base}/api/auth`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ accessToken: process.env.CLI_API_TOKEN }) });
             const token = String(record(await auth.json()).token);
@@ -109,9 +147,12 @@ enabled = false
             let ready!: (value: RuntimeReady) => void;
             const readiness = new Promise<RuntimeReady>(resolve => { ready = resolve; });
             running = runSharedRuntime({ workingDirectory: home, startedBy: 'runner' }, ready, stop.signal);
-            const startRunner = async () => {
+            const startRunner = async (codexAvailable = true) => {
                 const child = spawn(process.env.HAPI_BUN_EXEC!, ['run', resolve('src/index.ts'), 'runner', 'start-sync'], {
-                    env: { ...buildTestChildEnv(), HAPI_RUNNER_SUPERVISED: '1' }, stdio: 'ignore'
+                    env: {
+                        ...buildTestChildEnv(), HAPI_RUNNER_SUPERVISED: '1',
+                        ...(codexAvailable ? {} : { HAPI_CODEX_APP_SERVER_BIN: join(home, 'missing-codex') }),
+                    }, stdio: 'ignore'
                 });
                 trackChildProcess(child, 'reconnect-runner');
                 runners.push(child);
@@ -140,7 +181,9 @@ enabled = false
             expect(await notifyRunnerSessionStarted(primary.sessionId, primary.getMetadata()!)).not.toHaveProperty('error');
             expect(await killProcessByChildProcess(firstRunner)).toBe(true);
             // A real replacement Runner must load the durable live PID record.
-            await startRunner();
+            // Losing launch availability cannot prevent reconnecting the
+            // already-running runtime, including uncached native /new roots.
+            const recoveryRunner = await startRunner(false);
             const send = (sid: string, text: string) => api(`/sessions/${sid}/messages`, { text, localId: randomUUID() });
             const answered = async (sid: string, text: string) => {
                 const history = await api(`/sessions/${sid}/messages`);
@@ -186,9 +229,32 @@ enabled = false
             expect(primarySocket.id).toBe(primaryConnection);
             expect(record(record((await api(`/sessions/${sibling.sessionId}`)).session).metadata).hostPid).toBe(process.pid);
 
+            // Restart the actual Hub over the same database while native work
+            // is waiting on the local model. Neither wrapper nor roots restart.
+            await send(primary.sessionId, 'HELD_TURN_HUB_RESTART');
+            await eventually(async () => Boolean(held), 'native turn held before Hub restart');
+            expect(await killProcessByChildProcess(firstHub)).toBe(true);
+            await eventually(async () => !primarySocket.connected && !siblingSocket.connected, 'both roots observe Hub shutdown');
+            await startHub();
+            await eventually(async () => record((await api(`/sessions/${primary.sessionId}`)).session).active === true, 'primary rejoins restarted Hub');
+            await eventually(async () => record((await api(`/sessions/${sibling.sessionId}`)).session).active === true, 'sibling rejoins restarted Hub');
+            reply(held!.response, held!.prompt);
+            held = undefined;
+            await eventually(() => answered(primary.sessionId, 'HELD_TURN_HUB_RESTART'), 'in-flight reply reaches restarted Hub');
+            expect(requests.filter(prompt => prompt.includes('HELD_TURN_HUB_RESTART'))).toHaveLength(1);
+            expect(await answered(primary.sessionId, 'AFTER_RECONNECT')).toBe(true);
+            await send(sibling.sessionId, 'AFTER_HUB_RESTART');
+            await eventually(() => answered(sibling.sessionId, 'AFTER_HUB_RESTART'), 'old sibling accepts new messages after Hub restart');
+            expect(record(record((await api(`/sessions/${primary.sessionId}`)).session).metadata).hostPid).toBe(process.pid);
+
             // Ending one root must release its resume ownership even though
             // the wrapper remains alive for the sibling.
             await api(`/sessions/${primary.sessionId}/archive`, {});
+            // Once cold, this root really needs an executable. Recovery must
+            // not bypass launch preflight for new native executions.
+            await expect(api(`/sessions/${primary.sessionId}/resume`, {})).rejects.toThrow('codex has invalid runner configuration');
+            expect(await killProcessByChildProcess(recoveryRunner)).toBe(true);
+            await startRunner();
             expect((await api(`/sessions/${primary.sessionId}/resume`, {})).sessionId).toBe(primary.sessionId);
             await send(primary.sessionId, 'AFTER_ARCHIVE_REOPEN');
             await eventually(() => answered(primary.sessionId, 'AFTER_ARCHIVE_REOPEN'), 'archived root cold-resumes without waiting for sibling wrapper exit');
@@ -208,12 +274,18 @@ enabled = false
                     }
                 })
             ]);
+            const hubCleanup = await Promise.allSettled(hubs.map(async child => {
+                if (child.exitCode === null && child.signalCode === null && !await killProcessByChildProcess(child)) {
+                    throw new Error('Test Hub survived cleanup');
+                }
+            }));
             model.closeAllConnections();
             await new Promise<void>(resolve => model.close(() => resolve()));
             vi.unstubAllEnvs();
+            configuration._setApiUrl(originalApiUrl);
             captured.sessions.clear();
             await rm(home, { recursive: true, force: true });
-            const failed = cleanup.find(result => result.status === 'rejected');
+            const failed = [...cleanup, ...hubCleanup].find(result => result.status === 'rejected');
             if (failed?.status === 'rejected') throw failed.reason;
         }
     }, 120_000);
